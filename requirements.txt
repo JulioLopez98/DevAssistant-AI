@@ -1,0 +1,11 @@
+# Framework de agentes y estado
+langgraph
+langgraph-checkpoint-sqlite
+
+# Modelo y mensajes / herramientas
+langchain-openai
+langchain-core
+
+# Variables de entorno y consultas HTTP
+python-dotenv
+requests
