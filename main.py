@@ -1,6 +1,7 @@
 import os
 import sqlite3
-from typing import TypedDict, cast, Annotated
+from typing import TypedDict, cast, Annotated, cast, Any
+import uuid
 
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
@@ -16,6 +17,13 @@ from langchain_core.messages import (
     ToolMessage
 )
 
+from langfuse.langchain import CallbackHandler
+from langfuse import get_client
+from langsmith import Client
+from langfuse import Langfuse
+from langsmith import tracing_context
+from masking import mask_otel_spans, anonimizar_langsmith
+
 from tools.pypi_tool import consultar_paquete
 from tools.docs_tool import buscar_documentacion
 
@@ -25,6 +33,17 @@ from tools.docs_tool import buscar_documentacion
 
 #Cargamos las variables de entorno del archivo .env
 load_dotenv()
+
+# Configuramos Langfuse para proteger las trazas
+langfuse = Langfuse(mask_otel_spans=mask_otel_spans)
+
+#Conectamos Langfuse para registrar las ejecuciones
+langfuse_handler = CallbackHandler()
+
+#Crear un cliente de LangSmith con nuesra funcion para anonimizar
+langsmith_client = Client(
+    anonymizer=cast(Any, anonimizar_langsmith)
+)
 
 #Obtenemos el identificador del modelo
 MODEL_ID = os.getenv("MODEL_ID", "gpt-4.1-mini")
@@ -47,30 +66,43 @@ herramientas = [consultar_paquete, buscar_documentacion]
 modelo_con_tools = modelo.bind_tools(herramientas)
 
 # ============================================================
-# 2. INSTRUCCIONES DEL ASISTENTE
+# 2. GESTION DE PROMPTS
 # ============================================================
 
-#Definimos el comportamiento que tendra nuestro asistente
-INSTRUCCIONES = """
-Eres DevAssistant AI, un asistente especializado en
-programación y desarrollo de software.
+#Elegimos la plataforma y version desde el archivo .env
+PROMPT_PROVIDER = os.getenv("PROMPT_PROVIDER", "langfuse").lower()
+PROMPT_VERSION = int(os.getenv("PROMPT_VERSION", "1"))
 
-Responde siempre en español, salvo que el usuario
-solicite expresamente otro idioma.
+#Identificadores de los commits de LangSmith
+COMMITS_LANGSMITH = {
+    1: "5d4b482b",
+    2: "0b6de0a2"
+}
 
-Explica los conceptos técnicos de forma clara y sencilla.
+#Recuperamos las instrucciones desde la plataforma elegida
+if PROMPT_PROVIDER == "langfuse":
+    cliente = get_client()
+    prompt = cliente.get_prompt(
+        "devassistant-system",
+        version=PROMPT_VERSION
+    )
+    INSTRUCCIONES = prompt.prompt
+    PROMPT_ID = f"langfuse-v{PROMPT_VERSION}"
 
-Utiliza consultar_paquete cuando necesites obtener
-información actualizada sobre paquetes de Python,
-como su versión, descripción o requisitos.
+elif PROMPT_PROVIDER == "langsmith":
+    cliente = Client()
+    commit = COMMITS_LANGSMITH[PROMPT_VERSION]
+    prompt = cliente.pull_prompt(
+        f"devassistant-system:{commit}"
+    )
+    INSTRUCCIONES = prompt.messages[0].prompt.template
+    PROMPT_ID = f"langsmith-{commit}"
 
-No inventes versiones ni resultados de herramientas.
+else:
+    raise ValueError("Proveedor de prompts no reconocido")
 
-Si una herramienta devuelve un error, explícalo
-de forma comprensible.
+print(f"Prompt cargado: {PROMPT_ID}")
 
-Sé preciso, amable y directo.
-"""
 
 # ============================================================
 # 3. ESTADO DEL GRAFO
@@ -283,18 +315,19 @@ app = grafo.compile(checkpointer=memoria)
 # 8. EJECUCIÓN DEL GRAFO
 # ============================================================
 
+#Identidicador de esta conversacion
+conversation_id = f"devassistant-{uuid.uuid4().hex[:8]}"
+
 if __name__ == "__main__":
     #Identidicador de la conversacion. Si reutilizamos este ID, recuperamos el historial guardado
     config: RunnableConfig = {
         "configurable": {
-            "thread_id": "devassistant-001"
-        }
+            "thread_id": conversation_id
+        },
+        "callbacks": [langfuse_handler],  # Registramos las ejecuciones en Langfuse
     }
 
-    # --------------------------------------------------------
     # MOSTRAR LA CONVERSACIÓN
-    # --------------------------------------------------------
-
     print("\n" + "=" * 55)
     print("                  DEVASSISTANT AI")
     print("=" * 55)
@@ -320,21 +353,37 @@ if __name__ == "__main__":
         #Creamos el mensaje de usuario
         nuevo_mensaje = HumanMessage(content=pregunta)
 
-        #Ejecutamos el grafo con el ID de conversacion. LangGraph recupera automaticamente el historial guardado
-        estado = cast(
-            Estado,
-            app.invoke(
-                {
-                    "mensajes": [nuevo_mensaje],
-                    "llamadas_tools": 0,
-                    "errores": []
-                },
-                config=config
+        #Identificador unico para cada pregunta
+        query_id = str(uuid.uuid4())
+
+        #Metadatos que acompañaran a la ejecucion
+        config["metadata"] = {
+            "query_id": query_id,
+            "conversation_id": conversation_id,
+            "model": MODEL_ID,
+            "promt_version": PROMPT_ID
+        }
+
+        with tracing_context(
+            enabled=True,
+            client=langsmith_client
+        ):
+
+            #Ejecutamos el grafo con el ID de conversacion. LangGraph recupera automaticamente el historial guardado
+            estado = cast(
+                Estado,
+                app.invoke(
+                    {
+                        "mensajes": [nuevo_mensaje],
+                        "llamadas_tools": 0,
+                        "errores": []
+                    },
+                    config=config
+                )
             )
-        )
 
-        #Recuperamos la ultima respuesta del asistente
-        respuesta = estado["mensajes"][-1]
+            #Recuperamos la ultima respuesta del asistente
+            respuesta = estado["mensajes"][-1]
 
-        #Mostramos unicamente el contenido del mensaje
-        print(f"🤖 ASISTENTE: {respuesta.content}\n")
+            #Mostramos unicamente el contenido del mensaje
+            print(f"🤖 ASISTENTE: {respuesta.content}\n")

@@ -1,5 +1,7 @@
 import requests
 from langchain_core.tools import tool
+import re
+import html
 
 # ============================================================
 # HERRAMIENTA: BUSCAR DOCUMENTACIÓN TÉCNICA
@@ -31,7 +33,8 @@ def buscar_documentacion(consulta: str) -> dict:
         "site": "stackoverflow",  # Buscamos únicamente en Stack Overflow.
         "sort": "relevance",      # Ordenamos por relevancia.
         "order": "desc",          # Orden descendente.
-        "pagesize": 3             # Recuperamos como máximo 3 resultados.
+        "pagesize": 3,             # Recuperamos como máximo 3 resultados.
+        "filter" : "withbody"  # Incluimos el cuerpo de la pregunta en la respuesta.
     }
 
     #3. CONSULTAR A LA API
@@ -51,9 +54,18 @@ def buscar_documentacion(consulta: str) -> dict:
         #get("items", []) devuelve la lista de resultados o una lista vacia si no hay resultados
         for item in datos.get("items", []):
 
+            contenido = item.get("body", "") # Recuperamos el contenido de la pregunta (cuerpo HTML)
+
+            contenido = re.sub(r"<[^>]+>", " ", contenido)  # Elimina etiquetas HTML
+
+            contenido = html.unescape(contenido)  # Decodifica entidades HTML
+            contenido = " ".join(contenido.split())  # Elimina espacios en blanco extra
+
+            #Guardamos los datos y un fragmento de la regunta
             resultados.append({
                 "titulo": item.get("title"),
                 "enlace": item.get("link"),
+                "contenido" : contenido[:800],
                 "respuestas": item.get("answer_count", 0),
                 "resuelta": item.get("is_answered", False)
             })
